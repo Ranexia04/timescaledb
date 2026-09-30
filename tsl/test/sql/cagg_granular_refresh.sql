@@ -10,6 +10,8 @@
 -- and leaves the tracking rows to be reclaimed once nothing references their seqnum
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
+-- Report refresh statistics throughout.
+SET timescaledb.cagg_refresh_stats_level TO summary;
 
 SET timezone TO 'UTC';
 SET timescaledb.current_timestamp_mock = '2025-01-10 00:00:00+00';
@@ -1234,3 +1236,63 @@ ORDER BY tenant;
 
 DROP MATERIALIZED VIEW coll_daily;
 DROP TABLE collide;
+
+-- Additional tests for the GUC that controls different levels of
+-- stats reporting for refresh.
+
+CREATE TABLE stats(time timestamptz NOT NULL, tenant text, value float);
+SELECT create_hypertable('stats', 'time');
+ALTER TABLE stats SET (
+    timescaledb.cagg_enable_granular_refresh = true,
+    timescaledb.cagg_granular_refresh_column = 'tenant',
+    timescaledb.cagg_granular_refresh_start_offset = :'granular_refresh_lookback',
+    timescaledb.cagg_granular_refresh_end_offset = '1 day'
+);
+
+CREATE MATERIALIZED VIEW stats_daily
+  WITH (timescaledb.continuous) AS
+  SELECT time_bucket('1 day', time) AS bucket, tenant, count(*) AS cnt
+  FROM stats GROUP BY bucket, tenant WITH NO DATA;
+ALTER MATERIALIZED VIEW stats_daily SET (timescaledb.enable_granular_refresh = true);
+
+-- Materialize once so the threshold moves up and the late inserts below log
+-- invalidations.
+INSERT INTO stats VALUES ('2024-06-01 00:00+00', 'seed', 1);
+CALL refresh_continuous_aggregate('stats_daily', NULL, '2024-07-01 00:00+00');
+
+-- A manual refresh at verbose_log: the summary, and the per-range line.
+-- Note that we see two summary lines because one is emitted to the log
+-- and one to NOTICE.
+SET client_min_messages TO LOG;
+SET timescaledb.cagg_refresh_stats_level TO verbose_log;
+INSERT INTO stats VALUES ('2020-03-01 00:00+00', 't1', 1);
+CALL refresh_continuous_aggregate('stats_daily', '2020-03-01 00:00+00', '2020-03-02 00:00+00');
+RESET client_min_messages;
+
+-- Both levels on a policy refresh. run_job runs the policy in this session, so
+-- the NOTICE is visible here; a scheduled run has no client and the log
+-- copy would be the only record it leaves.
+SELECT add_continuous_aggregate_policy('stats_daily',
+    start_offset => INTERVAL '6 years',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day') AS job_id \gset
+
+SET client_min_messages TO LOG;
+
+-- summary: the summary alone, no per-range line.
+SET timescaledb.cagg_refresh_stats_level TO summary;
+INSERT INTO stats VALUES ('2020-04-01 00:00+00', 't2', 1);
+CALL run_job(:job_id);
+
+-- verbose_log: the per-range line as well.
+SET timescaledb.cagg_refresh_stats_level TO verbose_log;
+INSERT INTO stats VALUES ('2020-04-01 06:00+00', 't3', 1);
+CALL run_job(:job_id);
+
+RESET client_min_messages;
+
+SELECT delete_job(:job_id);
+DROP MATERIALIZED VIEW stats_daily;
+DROP TABLE stats;
+
+RESET timescaledb.cagg_refresh_stats_level;
